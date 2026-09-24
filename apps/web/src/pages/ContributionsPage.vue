@@ -72,7 +72,7 @@ onMounted(load);
             <td>
               <div class="inline">
                 <RouterLink v-if="item.revision_status !== 'pending'" class="button secondary small" :to="`/submit/${item.id}`">
-                  {{ item.status === "published" ? "创建修订" : "继续编辑" }}
+                  {{ item.status === "published" && item.revision_status === "published" ? "创建修订" : "继续编辑" }}
                 </RouterLink>
                 <span v-else class="badge pending">修订审核中</span>
                 <RouterLink v-if="item.status === 'published'" class="button ghost small" :to="`/features/${item.id}`">查看</RouterLink>

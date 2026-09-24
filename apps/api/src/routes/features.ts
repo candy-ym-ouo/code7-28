@@ -8,6 +8,7 @@ import { optionalAuth, requireAuth, requireVerifiedContributor } from "../auth";
 import { deleteObject, publicMediaUrl } from "../storage";
 import { config } from "../config";
 import { recordAudit } from "../audit";
+import { EDITABLE_REVISION_STATUSES, latestWorkingRevision, pickWorkingRevision } from "../revision-recovery";
 
 type MediaRow = {
   id: string;
@@ -225,6 +226,34 @@ export async function featureRoutes(app: FastifyInstance) {
       [input.id]
     );
 
+    let workingRevision: {
+      id: string;
+      revisionNo: number;
+      status: string;
+      rejectionReasonCode: string | null;
+      moderationNotes: string | null;
+    } | null = null;
+    if (canInspectPrivate) {
+      const revisions = await query<{ id: string; revision_no: number; status: string; rejection_reason_code: string | null; moderation_notes: string | null }>(
+        `SELECT id, revision_no, status, rejection_reason_code, moderation_notes
+         FROM feature_revisions WHERE feature_id = $1`,
+        [input.id]
+      );
+      const working = latestWorkingRevision(
+        revisions.rows.map((item) => ({ id: item.id, revisionNo: item.revision_no, status: item.status }))
+      );
+      if (working) {
+        const workingRow = revisions.rows.find((item) => item.id === working.id)!;
+        workingRevision = {
+          id: workingRow.id,
+          revisionNo: workingRow.revision_no,
+          status: workingRow.status,
+          rejectionReasonCode: workingRow.rejection_reason_code,
+          moderationNotes: workingRow.moderation_notes
+        };
+      }
+    }
+
     return {
       id: row.id,
       ownerId: row.owner_id,
@@ -242,7 +271,75 @@ export async function featureRoutes(app: FastifyInstance) {
       updatedAt: row.updated_at,
       ...row.payload,
       media: serializeMedia(row.media),
-      confirmations: confirmations.rows
+      confirmations: confirmations.rows,
+      workingRevision
+    };
+  });
+
+  // 编辑页恢复边界：返回作者应当继续编辑的修订（被驳回/待修改/草稿优先），
+  // 而不是旧公开版本，避免已发布修订被驳回后改动丢失。
+  app.get("/features/:id/edit", { preHandler: requireAuth }, async (request) => {
+    const input = z.object({ id: z.string().uuid() }).parse(request.params);
+    const feature = await query<{
+      id: string;
+      owner_id: string;
+      status: string;
+      current_revision_id: string | null;
+      created_at: Date;
+      updated_at: Date;
+    }>(
+      `SELECT id, owner_id, status, current_revision_id, created_at, updated_at
+       FROM map_features WHERE id = $1 AND deleted_at IS NULL`,
+      [input.id]
+    );
+    const row = feature.rows[0];
+    if (!row) throw notFound("Feature not found");
+    const canEdit = row.owner_id === request.user!.id || ["moderator", "admin"].includes(request.user!.role);
+    if (!canEdit) throw forbidden();
+
+    const revisions = await query<{
+      id: string;
+      revision_no: number;
+      status: string;
+      payload: Record<string, unknown>;
+      rejection_reason_code: string | null;
+      moderation_notes: string | null;
+    }>(
+      `SELECT id, revision_no, status, payload, rejection_reason_code, moderation_notes
+       FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC`,
+      [input.id]
+    );
+    const picked = pickWorkingRevision(
+      revisions.rows.map((item) => ({ id: item.id, revisionNo: item.revision_no, status: item.status })),
+      row.current_revision_id
+    );
+    if (!picked) throw notFound("Revision not found");
+    const revision = revisions.rows.find((item) => item.id === picked.revision.id)!;
+
+    const media = await query<MediaRow>(
+      `SELECT ma.id, ma.privacy_status, ma.public_object_key, ma.public_thumbnail_object_key
+       FROM revision_media rm
+       JOIN media_assets ma ON ma.id = rm.media_id AND ma.deleted_at IS NULL
+       WHERE rm.revision_id = $1
+       ORDER BY rm.sort_order`,
+      [revision.id]
+    );
+
+    return {
+      id: row.id,
+      ownerId: row.owner_id,
+      status: row.status,
+      currentRevisionId: row.current_revision_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      revisionId: revision.id,
+      revisionNo: revision.revision_no,
+      revisionStatus: revision.status,
+      revisionEditable: picked.editable,
+      rejectionReasonCode: revision.rejection_reason_code,
+      moderationNotes: revision.moderation_notes,
+      ...revision.payload,
+      media: serializeMedia(media.rows)
     };
   });
 
@@ -287,39 +384,53 @@ export async function featureRoutes(app: FastifyInstance) {
     const userId = request.user!.id;
 
     await transaction(async (client) => {
-      const feature = await client.query<{ status: string; owner_id: string }>(
-        "SELECT status, owner_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+      const feature = await client.query<{ status: string; owner_id: string; current_revision_id: string | null }>(
+        "SELECT status, owner_id, current_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
       );
       const row = feature.rows[0];
       if (!row) throw notFound("Feature not found");
       if (row.owner_id !== userId) throw forbidden();
-      if (!["draft", "rejected", "changes_requested"].includes(row.status)) {
+      // 已发布/已隐藏内容允许通过此端点继续编辑其工作修订（被驳回、待修改或草稿）；
+      // 公开投影只在审核批准时切换，这里绝不回写。
+      if (!["draft", "rejected", "changes_requested", "published", "hidden"].includes(row.status)) {
         throw conflict("Only draft or rejected content can be edited at this endpoint");
       }
       const category = await client.query("SELECT 1 FROM categories WHERE key = $1 AND is_active = true", [input.categoryKey]);
       if (!category.rowCount) throw new AppError(400, "VALIDATION_FAILED", "Unknown or inactive category");
       await assertMediaUsable(client, userId, input.mediaIds);
       const revision = await client.query<{ id: string }>(
-        "SELECT id FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC LIMIT 1 FOR UPDATE",
-        [params.id]
+        `SELECT id FROM feature_revisions
+         WHERE feature_id = $1 AND status = ANY($2::content_status[])
+         ORDER BY revision_no DESC LIMIT 1 FOR UPDATE`,
+        [params.id, [...EDITABLE_REVISION_STATUSES]]
       );
       const revisionId = revision.rows[0]?.id;
-      if (!revisionId) throw notFound("Revision not found");
+      if (!revisionId) {
+        throw conflict("No editable revision exists; wait for moderation or create a new revision");
+      }
+      // 保留 rejection_reason_code / moderation_notes：作者编辑期间仍需看到审核反馈，
+      // 重新提交（submit）时才清除。
       await client.query(
         `UPDATE feature_revisions
-         SET payload = $2::jsonb, status = 'draft', rejection_reason_code = NULL, moderation_notes = NULL, updated_at = now()
+         SET payload = $2::jsonb, status = 'draft', updated_at = now()
          WHERE id = $1`,
         [revisionId, JSON.stringify(payloadWithDate(input))]
       );
       await replaceRevisionMedia(client, revisionId, input.mediaIds);
-      await client.query(
-        `UPDATE map_features
-         SET category_key = $2, geom = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-             location_accuracy_m = $5, status = 'draft', updated_at = now()
-         WHERE id = $1`,
-        [params.id, input.categoryKey, input.longitude, input.latitude, input.locationAccuracyM]
-      );
+      if (!row.current_revision_id) {
+        // 从未发布过的内容：feature 行就是唯一投影，可以同步位置与分类。
+        await client.query(
+          `UPDATE map_features
+           SET category_key = $2, geom = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+               location_accuracy_m = $5, status = 'draft', updated_at = now()
+           WHERE id = $1`,
+          [params.id, input.categoryKey, input.longitude, input.latitude, input.locationAccuracyM]
+        );
+      } else {
+        // 已发布内容：公开投影保持不变，仅触碰更新时间用于“我的投稿”排序。
+        await client.query("UPDATE map_features SET updated_at = now() WHERE id = $1", [params.id]);
+      }
     });
 
     return { status: "draft" };
@@ -352,6 +463,15 @@ export async function featureRoutes(app: FastifyInstance) {
         [params.id]
       );
       if (pending.rowCount) throw conflict("A revision is already waiting for moderation");
+      // 防分叉：存在未提交的工作修订（草稿/被驳回/待修改）时，必须在其上继续编辑，
+      // 而不是从旧公开版本再开新修订，否则作者此前的改动会被静默丢弃。
+      const editable = await client.query(
+        "SELECT 1 FROM feature_revisions WHERE feature_id = $1 AND status = ANY($2::content_status[]) LIMIT 1",
+        [params.id, [...EDITABLE_REVISION_STATUSES]]
+      );
+      if (editable.rowCount) {
+        throw conflict("An unsubmitted revision already exists; continue editing it instead of creating a new one");
+      }
       await assertMediaUsable(client, userId, input.mediaIds);
       const next = await client.query<{ next: number }>(
         "SELECT COALESCE(MAX(revision_no), 0) + 1 AS next FROM feature_revisions WHERE feature_id = $1",

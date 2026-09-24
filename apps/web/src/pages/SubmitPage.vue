@@ -9,6 +9,13 @@ import { apiFetch } from "../lib/api";
 type Category = { key: CategoryKey; name: string };
 type MediaResult = { id: string; status: string; url: string | null; thumbnailUrl: string | null };
 type UploadItem = { file?: File; media?: MediaResult };
+type LoadedRevision = {
+  id: string;
+  status: string;
+  editable: boolean;
+  rejectionReasonCode: string | null;
+  moderationNotes: string | null;
+};
 type FieldDefinition = {
   key: string;
   label: string;
@@ -64,7 +71,13 @@ const uploads = ref<UploadItem[]>([]);
 const error = ref("");
 const success = ref("");
 const busy = ref(false);
-const loadedFeatureStatus = ref("");
+const loadedRevision = ref<LoadedRevision | null>(null);
+
+const revisionRejected = computed(() =>
+  loadedRevision.value !== null &&
+  ["rejected", "changes_requested"].includes(loadedRevision.value.status) &&
+  Boolean(loadedRevision.value.rejectionReasonCode)
+);
 
 const form = reactive({
   categoryKey: categoryKeys[0] as CategoryKey,
@@ -155,8 +168,16 @@ function recordMedia(index: number, media: MediaResult) {
 
 async function loadExisting() {
   if (!editId.value) return;
-  const feature = await apiFetch<Record<string, any>>(`/features/${editId.value}`);
-  loadedFeatureStatus.value = feature.status;
+  // 编辑恢复边界：加载工作修订（草稿/被驳回/待修改），而不是旧公开版本，
+  // 否则保存会从旧版本分叉出新修订，丢掉审核驳回前的改动。
+  const feature = await apiFetch<Record<string, any>>(`/features/${editId.value}/edit`);
+  loadedRevision.value = {
+    id: feature.revisionId,
+    status: feature.revisionStatus,
+    editable: Boolean(feature.revisionEditable),
+    rejectionReasonCode: feature.rejectionReasonCode ?? null,
+    moderationNotes: feature.moderationNotes ?? null
+  };
   form.categoryKey = feature.categoryKey;
   form.title = feature.title;
   form.description = feature.description;
@@ -217,9 +238,10 @@ async function submit() {
       const created = await apiFetch<{ id: string }>("/features", { method: "POST", body: payload });
       featureId = created.id;
       await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
-    } else if (["draft", "rejected", "changes_requested"].includes(loadedFeatureStatus.value)) {
+    } else if (loadedRevision.value?.editable) {
+      // 覆盖现有工作修订（草稿/被驳回/待修改），不新建修订——驳回前的改动得以保留。
       await apiFetch(`/features/${featureId}/draft`, { method: "PATCH", body: payload });
-      await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
+      await apiFetch(`/features/${featureId}/revisions/${loadedRevision.value.id}/submit`, { method: "POST" });
     } else {
       const revision = await apiFetch<{ id: string }>(`/features/${featureId}/revisions`, { method: "POST", body: payload });
       await apiFetch(`/features/${featureId}/revisions/${revision.id}/submit`, { method: "POST" });
@@ -251,6 +273,13 @@ onMounted(async () => {
 
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="success" class="success-box">{{ success }}</div>
+    <div v-if="revisionRejected" class="notice-box">
+      <strong>上次提交未通过审核，请根据反馈修改后重新提交：</strong>
+      {{ loadedRevision?.rejectionReasonCode }}<template v-if="loadedRevision?.moderationNotes">：{{ loadedRevision.moderationNotes }}</template>
+    </div>
+    <p v-if="loadedRevision && loadedRevision.status === 'draft' && !revisionRejected" class="muted">
+      当前为未提交的草稿修订，保存并提交不会影响已公开版本。
+    </p>
 
     <div class="stack">
       <section class="card"><div class="card-body">

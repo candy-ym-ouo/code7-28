@@ -41,9 +41,10 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/features` | 创建草稿 |
-| `PATCH` | `/features/:id/draft` | 更新草稿或被拒内容 |
+| `GET` | `/features/:id/edit` | 作者/审核员加载编辑视图：恢复最新工作修订（草稿/被拒/待修改），不回退旧公开版本 |
+| `PATCH` | `/features/:id/draft` | 覆盖最新可编辑修订；已发布内容的公开投影不受影响，保留审核反馈直至重新交 |
 | `POST` | `/features/:id/submit` | 提交最新草稿 |
-| `POST` | `/features/:id/revisions` | 为已发布内容创建修订 |
+| `POST` | `/features/:id/revisions` | 为已发布内容创建修订；存在未提交修订时返回 409 防止分叉 |
 | `POST` | `/features/:id/revisions/:revisionId/submit` | 提交修订 |
 | `GET` | `/features/:id/revisions` | 作者/审核员查看历史 |
 | `GET` | `/me/features` | 我的投稿 |

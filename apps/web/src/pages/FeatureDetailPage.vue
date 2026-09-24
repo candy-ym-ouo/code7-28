@@ -25,6 +25,13 @@ type Feature = {
   updatedAt: string;
   firstPublishedAt: string | null;
   confirmations: Array<{ result: string; count: number }>;
+  workingRevision?: {
+    id: string;
+    revisionNo: number;
+    status: string;
+    rejectionReasonCode: string | null;
+    moderationNotes: string | null;
+  } | null;
 };
 
 type Comment = {
@@ -57,6 +64,18 @@ const detailLabels: Record<string, string> = {
 
 const canEdit = computed(() => Boolean(auth.user && feature.value && auth.user.id === feature.value.ownerId));
 const detailEntries = computed(() => Object.entries(feature.value?.details ?? {}).filter(([, value]) => value !== null && value !== ""));
+
+const revisionPending = computed(() => feature.value?.workingRevision?.status === "pending");
+const revisionRejected = computed(() =>
+  Boolean(feature.value?.workingRevision) &&
+  ["rejected", "changes_requested"].includes(feature.value!.workingRevision!.status)
+);
+const editButtonLabel = computed(() => {
+  const status = feature.value?.workingRevision?.status;
+  if (status === "rejected" || status === "changes_requested") return "继续修改未通过的修订";
+  if (status === "draft") return "继续编辑草稿修订";
+  return "创建修订";
+});
 
 function displayValue(value: unknown) {
   if (value === true) return "是";
@@ -149,13 +168,19 @@ onMounted(load);
           <p>{{ feature.description }}</p>
         </div>
         <div class="inline">
-          <RouterLink v-if="canEdit" class="button secondary" :to="`/submit/${feature.id}`">创建修订</RouterLink>
+          <RouterLink v-if="canEdit && !revisionPending" class="button secondary" :to="`/submit/${feature.id}`">
+            {{ editButtonLabel }}
+          </RouterLink>
+          <span v-else-if="canEdit && revisionPending" class="badge pending">修订审核中</span>
           <button class="button ghost" type="button" @click="report">举报</button>
         </div>
       </div>
 
       <p v-if="error" class="error-box">{{ error }}</p>
       <p v-if="notice" class="success-box">{{ notice }}</p>
+      <p v-if="canEdit && revisionRejected && feature.workingRevision" class="notice-box">
+        你有一个修订未通过审核（{{ feature.workingRevision.rejectionReasonCode }}<template v-if="feature.workingRevision.moderationNotes">：{{ feature.workingRevision.moderationNotes }}</template>），公开版本不受影响，点击“继续修改未通过的修订”可恢复此前的改动。
+      </p>
 
       <div class="detail-layout">
         <div class="stack">
