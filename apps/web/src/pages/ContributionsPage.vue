@@ -8,8 +8,10 @@ type Contribution = {
   status: string;
   created_at: string;
   updated_at: string;
-  revision_status: string;
-  payload: { title: string; description: string };
+  current_revision_id: string | null;
+  revision_id: string | null;
+  revision_status: string | null;
+  payload: { title: string; description: string } | null;
   rejection_reason_code: string | null;
   moderation_notes: string | null;
 };
@@ -63,18 +65,20 @@ onMounted(load);
           <tr v-for="item in items" :key="item.id">
             <td>
               <strong>{{ item.payload?.title ?? "未命名" }}</strong>
-              <p v-if="item.rejection_reason_code" class="muted">{{ item.rejection_reason_code }}{{ item.moderation_notes ? `：${item.moderation_notes}` : "" }}</p>
+              <p v-if="item.rejection_reason_code" class="muted">
+                {{ item.revision_status === "changes_requested" ? "需要修改" : "已拒绝" }}：{{ item.rejection_reason_code }}{{ item.moderation_notes ? `：${item.moderation_notes}` : "" }}
+              </p>
             </td>
             <td>{{ item.category_key }}</td>
             <td><span class="badge" :class="item.status">{{ statusLabels[item.status] ?? item.status }}</span></td>
-            <td>{{ statusLabels[item.revision_status] ?? item.revision_status }}</td>
+            <td>{{ item.revision_status ? (statusLabels[item.revision_status] ?? item.revision_status) : "—" }}</td>
             <td>{{ new Date(item.updated_at).toLocaleString() }}</td>
             <td>
               <div class="inline">
-                <RouterLink v-if="item.revision_status !== 'pending'" class="button secondary small" :to="`/submit/${item.id}`">
-                  {{ item.status === "published" ? "创建修订" : "继续编辑" }}
+                <span v-if="item.revision_status === 'pending'" class="badge pending">修订审核中</span>
+                <RouterLink v-else class="button secondary small" :to="`/submit/${item.id}`">
+                  {{ item.current_revision_id ? (item.revision_id ? "继续编辑修订" : "创建修订") : "继续编辑" }}
                 </RouterLink>
-                <span v-else class="badge pending">修订审核中</span>
                 <RouterLink v-if="item.status === 'published'" class="button ghost small" :to="`/features/${item.id}`">查看</RouterLink>
                 <button class="button danger small" type="button" @click="remove(item.id)">删除</button>
               </div>

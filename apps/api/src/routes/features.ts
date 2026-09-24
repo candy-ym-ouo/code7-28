@@ -16,6 +16,15 @@ type MediaRow = {
   public_thumbnail_object_key: string | null;
 };
 
+const EDITABLE_REVISION_STATUSES = ["draft", "rejected", "changes_requested"] as const;
+const MEDIA_SELECT_COLUMNS = `
+  jsonb_agg(jsonb_build_object(
+    'id', ma.id,
+    'privacy_status', ma.privacy_status,
+    'public_object_key', ma.public_object_key,
+    'public_thumbnail_object_key', ma.public_thumbnail_object_key
+  )) ORDER BY rm.sort_order`;
+
 function serializeMedia(media: MediaRow[] | null | undefined) {
   return (media ?? []).map((item) => ({
     id: item.id,
@@ -44,12 +53,46 @@ async function assertMediaUsable(client: PoolClient, ownerId: string, mediaIds: 
   if (invalid) throw new AppError(409, "MEDIA_NOT_READY", "All media must finish privacy processing before submission", { mediaStatus: invalid.privacy_status });
 }
 
+/**
+ * Replace the media bindings of one revision.
+ *
+ * Boundaries:
+ * - Only the join rows of THIS revision are touched. Media still referenced by
+ *   the published revision (or any other revision) stays bound there.
+ * - Media that becomes fully unbound is not deleted: it remains owned by the
+ *   contributor so a rejected draft can re-attach it. detach_reason records
+ *   why the binding went away for audit/recovery.
+ * - Re-attaching clears the detach marker.
+ */
 async function replaceRevisionMedia(client: PoolClient, revisionId: string, mediaIds: string[]) {
-  await client.query("DELETE FROM revision_media WHERE revision_id = $1", [revisionId]);
+  const detached = await client.query<{ media_id: string }>(
+    `DELETE FROM revision_media
+     WHERE revision_id = $1 AND NOT (media_id = ANY($2::uuid[]))
+     RETURNING media_id`,
+    [revisionId, mediaIds]
+  );
   for (const [index, mediaId] of mediaIds.entries()) {
     await client.query(
-      "INSERT INTO revision_media(revision_id, media_id, sort_order) VALUES ($1, $2, $3)",
+      `INSERT INTO revision_media(revision_id, media_id, sort_order)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (revision_id, media_id) DO UPDATE SET sort_order = EXCLUDED.sort_order`,
       [revisionId, mediaId, index]
+    );
+  }
+  if (mediaIds.length) {
+    await client.query(
+      "UPDATE media_assets SET detach_reason = NULL, updated_at = now() WHERE id = ANY($1::uuid[])",
+      [mediaIds]
+    );
+  }
+  const detachedIds = detached.rows.map((row) => row.media_id);
+  if (detachedIds.length) {
+    await client.query(
+      `UPDATE media_assets ma
+       SET detach_reason = 'revision_edited', updated_at = now()
+       WHERE ma.id = ANY($1::uuid[])
+         AND NOT EXISTS (SELECT 1 FROM revision_media rm WHERE rm.media_id = ma.id)`,
+      [detachedIds]
     );
   }
 }
@@ -173,42 +216,36 @@ export async function featureRoutes(app: FastifyInstance) {
     const result = await query(
       `SELECT
          mf.id, mf.owner_id, mf.category_key, mf.status, mf.location_accuracy_m,
+         mf.current_revision_id, mf.draft_revision_id,
          mf.first_published_at, mf.freshness_expires_at, mf.needs_review_at,
          mf.created_at, mf.updated_at, mf.deleted_at,
          ST_X(mf.geom::geometry) AS longitude,
          ST_Y(mf.geom::geometry) AS latitude,
          c.name AS category_name, c.icon AS category_icon,
-         COALESCE(mf.current_revision_id, latest.id) AS revision_id,
-         COALESCE(current_revision.payload, latest.payload) AS payload,
-         COALESCE(current_media.media, latest_media.media, '[]'::jsonb) AS media
+         cur.id AS current_revision_row_id, cur.payload AS current_payload,
+         cur_media.media AS current_media,
+         dr.id AS draft_revision_row_id, dr.revision_no AS draft_revision_no,
+         dr.status AS draft_revision_status, dr.payload AS draft_payload,
+         dr.rejection_reason_code AS draft_reason_code,
+         dr.moderation_notes AS draft_moderation_notes,
+         dr.submitted_at AS draft_submitted_at,
+         dr_media.media AS draft_media
        FROM map_features mf
        JOIN categories c ON c.key = mf.category_key
-       LEFT JOIN feature_revisions current_revision ON current_revision.id = mf.current_revision_id
+       LEFT JOIN feature_revisions cur ON cur.id = mf.current_revision_id
+       LEFT JOIN feature_revisions dr ON dr.id = mf.draft_revision_id
        LEFT JOIN LATERAL (
-         SELECT id, payload FROM feature_revisions WHERE feature_id = mf.id ORDER BY revision_no DESC LIMIT 1
-       ) latest ON true
-       LEFT JOIN LATERAL (
-         SELECT jsonb_agg(jsonb_build_object(
-           'id', ma.id,
-           'privacy_status', ma.privacy_status,
-           'public_object_key', ma.public_object_key,
-           'public_thumbnail_object_key', ma.public_thumbnail_object_key
-         ) ORDER BY rm.sort_order) AS media
+         SELECT ${MEDIA_SELECT_COLUMNS} AS media
          FROM revision_media rm
          JOIN media_assets ma ON ma.id = rm.media_id AND ma.deleted_at IS NULL
-         WHERE rm.revision_id = COALESCE(mf.current_revision_id, latest.id)
-       ) current_media ON true
+         WHERE rm.revision_id = cur.id
+       ) cur_media ON true
        LEFT JOIN LATERAL (
-         SELECT jsonb_agg(jsonb_build_object(
-           'id', ma.id,
-           'privacy_status', ma.privacy_status,
-           'public_object_key', ma.public_object_key,
-           'public_thumbnail_object_key', ma.public_thumbnail_object_key
-         ) ORDER BY rm.sort_order) AS media
+         SELECT ${MEDIA_SELECT_COLUMNS} AS media
          FROM revision_media rm
          JOIN media_assets ma ON ma.id = rm.media_id AND ma.deleted_at IS NULL
-         WHERE rm.revision_id = latest.id
-       ) latest_media ON true
+         WHERE rm.revision_id = dr.id
+       ) dr_media ON true
        WHERE mf.id = $1`,
       [input.id]
     );
@@ -216,6 +253,13 @@ export async function featureRoutes(app: FastifyInstance) {
     if (!row || row.deleted_at) throw notFound("Feature not found");
     const canInspectPrivate = request.user && (request.user.id === row.owner_id || ["moderator", "admin"].includes(request.user.role));
     if (row.status !== "published" && !canInspectPrivate) throw notFound("Feature not found");
+
+    // The base response always describes the publicly visible revision. For
+    // never-published features there is no public revision yet, so the draft
+    // payload is the only content available and only owners/moderators reach
+    // this branch.
+    const publicPayload = row.current_payload ?? row.draft_payload;
+    const publicMedia = row.current_payload ? row.current_media : row.draft_media;
 
     const confirmations = await query(
       `SELECT result, count(*)::int AS count
@@ -225,7 +269,7 @@ export async function featureRoutes(app: FastifyInstance) {
       [input.id]
     );
 
-    return {
+    const response: Record<string, unknown> = {
       id: row.id,
       ownerId: row.owner_id,
       categoryKey: row.category_key,
@@ -235,15 +279,35 @@ export async function featureRoutes(app: FastifyInstance) {
       longitude: Number(row.longitude),
       latitude: Number(row.latitude),
       locationAccuracyM: row.location_accuracy_m,
+      currentRevisionId: row.current_revision_id,
       firstPublishedAt: row.first_published_at,
       freshnessExpiresAt: row.freshness_expires_at,
       needsReviewAt: row.needs_review_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      ...row.payload,
-      media: serializeMedia(row.media),
-      confirmations: confirmations.rows
+      ...publicPayload,
+      media: serializeMedia(publicMedia ?? []),
+      confirmations: confirmations.rows,
+      draft: null
     };
+
+    // The in-flight draft/revision is exposed only to the owner and reviewers,
+    // independently of the public payload, so a rejected revision can never be
+    // confused with (or overwritten by) the old public version.
+    if (canInspectPrivate && row.draft_revision_row_id) {
+      response.draft = {
+        revisionId: row.draft_revision_row_id,
+        revisionNo: row.draft_revision_no,
+        status: row.draft_revision_status,
+        submittedAt: row.draft_submitted_at,
+        rejectionReasonCode: row.draft_reason_code,
+        moderationNotes: row.draft_moderation_notes,
+        ...row.draft_payload,
+        media: serializeMedia(row.draft_media ?? [])
+      };
+    }
+
+    return response;
   });
 
   app.post("/features", { preHandler: requireVerifiedContributor }, async (request, reply) => {
@@ -267,13 +331,15 @@ export async function featureRoutes(app: FastifyInstance) {
          RETURNING id`,
         [featureId, userId, JSON.stringify(payloadWithDate(input))]
       );
-      await replaceRevisionMedia(client, revision.rows[0]!.id, input.mediaIds);
+      const revisionId = revision.rows[0]!.id;
+      await client.query("UPDATE map_features SET draft_revision_id = $2 WHERE id = $1", [featureId, revisionId]);
+      await replaceRevisionMedia(client, revisionId, input.mediaIds);
       await recordAudit(client, {
         actorId: userId,
         action: "feature.draft_created",
         resourceType: "feature",
         resourceId: featureId,
-        metadata: { categoryKey: input.categoryKey }
+        metadata: { categoryKey: input.categoryKey, revisionId }
       });
       return featureId;
     });
@@ -287,39 +353,62 @@ export async function featureRoutes(app: FastifyInstance) {
     const userId = request.user!.id;
 
     await transaction(async (client) => {
-      const feature = await client.query<{ status: string; owner_id: string }>(
-        "SELECT status, owner_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+      const feature = await client.query<{
+        status: string;
+        owner_id: string;
+        current_revision_id: string | null;
+        draft_revision_id: string | null;
+      }>(
+        "SELECT status, owner_id, current_revision_id, draft_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
       );
       const row = feature.rows[0];
       if (!row) throw notFound("Feature not found");
       if (row.owner_id !== userId) throw forbidden();
-      if (!["draft", "rejected", "changes_requested"].includes(row.status)) {
-        throw conflict("Only draft or rejected content can be edited at this endpoint");
+      if (row.status === "hidden") throw conflict("Hidden content must be restored before it can be edited");
+      if (row.status === "deleted") throw conflict("Deleted content cannot be edited");
+
+      const revision = row.draft_revision_id
+        ? await client.query<{ id: string; status: string }>(
+            "SELECT id, status FROM feature_revisions WHERE id = $1 AND feature_id = $2 FOR UPDATE",
+            [row.draft_revision_id, params.id]
+          )
+        : await client.query<{ id: string; status: string }>(
+            "SELECT id, status FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC LIMIT 1 FOR UPDATE",
+            [params.id]
+          );
+      const revisionRow = revision.rows[0];
+      if (!revisionRow) throw notFound("Draft revision not found");
+      if (!EDITABLE_REVISION_STATUSES.includes(revisionRow.status as (typeof EDITABLE_REVISION_STATUSES)[number])) {
+        throw conflict("The current revision is already waiting for moderation and cannot be edited");
       }
       const category = await client.query("SELECT 1 FROM categories WHERE key = $1 AND is_active = true", [input.categoryKey]);
       if (!category.rowCount) throw new AppError(400, "VALIDATION_FAILED", "Unknown or inactive category");
       await assertMediaUsable(client, userId, input.mediaIds);
-      const revision = await client.query<{ id: string }>(
-        "SELECT id FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC LIMIT 1 FOR UPDATE",
-        [params.id]
-      );
-      const revisionId = revision.rows[0]?.id;
-      if (!revisionId) throw notFound("Revision not found");
+
       await client.query(
         `UPDATE feature_revisions
-         SET payload = $2::jsonb, status = 'draft', rejection_reason_code = NULL, moderation_notes = NULL, updated_at = now()
+         SET payload = $2::jsonb, status = 'draft', rejection_reason_code = NULL,
+             moderation_notes = NULL, reviewer_id = NULL, reviewed_at = NULL, updated_at = now()
          WHERE id = $1`,
-        [revisionId, JSON.stringify(payloadWithDate(input))]
+        [revisionRow.id, JSON.stringify(payloadWithDate(input))]
       );
-      await replaceRevisionMedia(client, revisionId, input.mediaIds);
-      await client.query(
-        `UPDATE map_features
-         SET category_key = $2, geom = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
-             location_accuracy_m = $5, status = 'draft', updated_at = now()
-         WHERE id = $1`,
-        [params.id, input.categoryKey, input.longitude, input.latitude, input.locationAccuracyM]
-      );
+      await replaceRevisionMedia(client, revisionRow.id, input.mediaIds);
+
+      if (row.current_revision_id) {
+        // A public revision exists: it must stay untouched. The edit only
+        // refreshes the in-flight draft; feature columns mirror the public
+        // revision and are not overwritten.
+        await client.query("UPDATE map_features SET updated_at = now() WHERE id = $1", [params.id]);
+      } else {
+        await client.query(
+          `UPDATE map_features
+           SET category_key = $2, geom = ST_SetSRID(ST_MakePoint($3, $4), 4326)::geography,
+               location_accuracy_m = $5, status = 'draft', draft_revision_id = $6, updated_at = now()
+           WHERE id = $1`,
+          [params.id, input.categoryKey, input.longitude, input.latitude, input.locationAccuracyM, revisionRow.id]
+        );
+      }
     });
 
     return { status: "draft" };
@@ -327,8 +416,7 @@ export async function featureRoutes(app: FastifyInstance) {
 
   app.post("/features/:id/submit", { preHandler: requireVerifiedContributor }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
-    const userId = request.user!.id;
-    await submitRevision(undefined, params.id, userId);
+    await submitRevision(undefined, params.id, request.user!.id);
     return { status: "pending" };
   });
 
@@ -337,21 +425,33 @@ export async function featureRoutes(app: FastifyInstance) {
     const input = createFeatureSchema.parse(request.body);
     const userId = request.user!.id;
     const revisionId = await transaction(async (client) => {
-      const feature = await client.query<{ owner_id: string; status: string }>(
-        "SELECT owner_id, status FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+      const feature = await client.query<{
+        owner_id: string;
+        status: string;
+        current_revision_id: string | null;
+        draft_revision_id: string | null;
+      }>(
+        "SELECT owner_id, status, current_revision_id, draft_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         [params.id]
       );
       const row = feature.rows[0];
       if (!row) throw notFound("Feature not found");
       if (row.owner_id !== userId) throw forbidden();
-      if (row.status === "deleted") throw conflict("Deleted content cannot be revised");
+      if (!row.current_revision_id) throw conflict("Use the draft endpoint before the first publication");
+      if (row.status !== "published") throw conflict("Only published content can receive a new revision");
+      if (row.draft_revision_id) {
+        const draft = await client.query<{ status: string }>(
+          "SELECT status FROM feature_revisions WHERE id = $1 FOR UPDATE",
+          [row.draft_revision_id]
+        );
+        const draftStatus = draft.rows[0]?.status;
+        if (draftStatus === "pending") throw conflict("A revision is already waiting for moderation");
+        if (draftStatus && EDITABLE_REVISION_STATUSES.includes(draftStatus as (typeof EDITABLE_REVISION_STATUSES)[number])) {
+          throw conflict("An editable draft revision already exists; update and resubmit it instead");
+        }
+      }
       const category = await client.query("SELECT 1 FROM categories WHERE key = $1 AND is_active = true", [input.categoryKey]);
       if (!category.rowCount) throw new AppError(400, "VALIDATION_FAILED", "Unknown or inactive category");
-      const pending = await client.query(
-        "SELECT 1 FROM feature_revisions WHERE feature_id = $1 AND status = 'pending' LIMIT 1",
-        [params.id]
-      );
-      if (pending.rowCount) throw conflict("A revision is already waiting for moderation");
       await assertMediaUsable(client, userId, input.mediaIds);
       const next = await client.query<{ next: number }>(
         "SELECT COALESCE(MAX(revision_no), 0) + 1 AS next FROM feature_revisions WHERE feature_id = $1",
@@ -362,8 +462,10 @@ export async function featureRoutes(app: FastifyInstance) {
          VALUES ($1, $2, $3, $4::jsonb, 'draft') RETURNING id`,
         [params.id, userId, next.rows[0]!.next, JSON.stringify(payloadWithDate(input))]
       );
-      await replaceRevisionMedia(client, inserted.rows[0]!.id, input.mediaIds);
-      return inserted.rows[0]!.id;
+      const newRevisionId = inserted.rows[0]!.id;
+      await replaceRevisionMedia(client, newRevisionId, input.mediaIds);
+      await client.query("UPDATE map_features SET draft_revision_id = $2, updated_at = now() WHERE id = $1", [params.id, newRevisionId]);
+      return newRevisionId;
     });
     return reply.code(201).send({ id: revisionId, status: "draft" });
   });
@@ -381,8 +483,14 @@ export async function featureRoutes(app: FastifyInstance) {
     if (!row) throw notFound("Feature not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
     const result = await query(
-      `SELECT id, revision_no, status, payload, submitted_at, reviewed_at, rejection_reason_code, moderation_notes, created_at, updated_at
-       FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC`,
+      `SELECT fr.id, fr.revision_no, fr.status, fr.payload, fr.submitted_at, fr.reviewed_at,
+              fr.rejection_reason_code, fr.moderation_notes, fr.created_at, fr.updated_at,
+              (fr.id = mf.current_revision_id) AS is_current,
+              (fr.id = mf.draft_revision_id) AS is_draft
+       FROM feature_revisions fr
+       JOIN map_features mf ON mf.id = fr.feature_id
+       WHERE fr.feature_id = $1
+       ORDER BY fr.revision_no DESC`,
       [params.id]
     );
     return result.rows;
@@ -452,12 +560,13 @@ export async function featureRoutes(app: FastifyInstance) {
   app.get("/me/features", { preHandler: requireAuth }, async (request) => {
     const result = await query(
       `SELECT mf.id, mf.category_key, mf.status, mf.created_at, mf.updated_at,
+              mf.current_revision_id,
               fr.id AS revision_id, fr.revision_no, fr.status AS revision_status,
-              fr.payload, fr.rejection_reason_code, fr.moderation_notes
+              COALESCE(fr.payload, cur.payload) AS payload,
+              fr.rejection_reason_code, fr.moderation_notes
        FROM map_features mf
-       LEFT JOIN LATERAL (
-         SELECT * FROM feature_revisions WHERE feature_id = mf.id ORDER BY revision_no DESC LIMIT 1
-       ) fr ON true
+       LEFT JOIN feature_revisions fr ON fr.id = mf.draft_revision_id
+       LEFT JOIN feature_revisions cur ON cur.id = mf.current_revision_id
        WHERE mf.owner_id = $1 AND mf.deleted_at IS NULL
        ORDER BY mf.updated_at DESC`,
       [request.user!.id]
@@ -490,7 +599,7 @@ export async function featureRoutes(app: FastifyInstance) {
         [params.id]
       );
       if (feature.rows[0]?.status !== "published") throw notFound("Published feature not found");
-      const inserted = await client.query(
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO feature_confirmations(feature_id, user_id, result, note)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (feature_id, user_id) DO UPDATE
@@ -523,28 +632,35 @@ export async function featureRoutes(app: FastifyInstance) {
 
 async function submitRevision(revisionId: string | undefined, featureId: string, userId: string) {
   await transaction(async (client) => {
-    const feature = await client.query<{ owner_id: string; status: string; current_revision_id: string | null }>(
-      "SELECT owner_id, status, current_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    const feature = await client.query<{
+      owner_id: string;
+      status: string;
+      current_revision_id: string | null;
+      draft_revision_id: string | null;
+    }>(
+      "SELECT owner_id, status, current_revision_id, draft_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
       [featureId]
     );
     const featureRow = feature.rows[0];
     if (!featureRow) throw notFound("Feature not found");
     if (featureRow.owner_id !== userId) throw forbidden();
 
-    const revision = revisionId
-      ? await client.query<{ id: string; status: string; payload: unknown }>(
-          "SELECT id, status, payload FROM feature_revisions WHERE id = $1 AND feature_id = $2 FOR UPDATE",
-          [revisionId, featureId]
-        )
-      : await client.query<{ id: string; status: string; payload: unknown }>(
-          "SELECT id, status, payload FROM feature_revisions WHERE feature_id = $1 ORDER BY revision_no DESC LIMIT 1 FOR UPDATE",
-          [featureId]
-        );
+    const targetRevisionId = revisionId ?? featureRow.draft_revision_id;
+    if (!targetRevisionId) throw notFound("Draft revision not found");
+    if (featureRow.draft_revision_id && targetRevisionId !== featureRow.draft_revision_id) {
+      throw conflict("Only the current in-flight revision can be submitted");
+    }
+
+    const revision = await client.query<{ id: string; status: string; payload: unknown }>(
+      "SELECT id, status, payload FROM feature_revisions WHERE id = $1 AND feature_id = $2 FOR UPDATE",
+      [targetRevisionId, featureId]
+    );
     const revisionRow = revision.rows[0];
     if (!revisionRow) throw notFound("Revision not found");
-    if (!["draft", "rejected", "changes_requested"].includes(revisionRow.status)) {
+    if (!EDITABLE_REVISION_STATUSES.includes(revisionRow.status as (typeof EDITABLE_REVISION_STATUSES)[number])) {
       throw conflict("Revision is not eligible for submission");
     }
+    if (featureRow.status === "hidden") throw conflict("Hidden content must be restored before resubmission");
 
     const payload = revisionRow.payload as { mediaIds?: string[] };
     await assertMediaUsable(client, userId, payload.mediaIds ?? []);

@@ -322,12 +322,15 @@ export async function authRoutes(app: FastifyInstance) {
     const userId = request.user!.id;
     const [features, comments, confirmations] = await Promise.all([
       query(
-        `SELECT mf.id, mf.status, mf.created_at, fr.payload
+        `SELECT mf.id AS feature_id, mf.status AS feature_status, mf.created_at,
+                fr.id AS revision_id, fr.revision_no, fr.status AS revision_status,
+                (fr.id = mf.current_revision_id) AS is_current_public,
+                (fr.id = mf.draft_revision_id) AS is_in_flight_draft,
+                fr.payload
          FROM map_features mf
-         JOIN feature_revisions fr ON fr.id = COALESCE(mf.current_revision_id, (
-           SELECT id FROM feature_revisions WHERE feature_id = mf.id ORDER BY revision_no DESC LIMIT 1
-         ))
-         WHERE mf.owner_id = $1 ORDER BY mf.created_at DESC`,
+         JOIN feature_revisions fr ON fr.feature_id = mf.id
+         WHERE mf.owner_id = $1
+         ORDER BY mf.created_at DESC, fr.revision_no DESC`,
         [userId]
       ),
       query("SELECT id, feature_id, body, status, created_at FROM comments WHERE author_id = $1 ORDER BY created_at DESC", [userId]),

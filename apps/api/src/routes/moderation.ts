@@ -59,6 +59,16 @@ export async function moderationRoutes(app: FastifyInstance) {
   app.post("/moderation/features/:id/approve", { preHandler: requireModerator }, async (request) => {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     await transaction(async (client) => {
+      const featureResult = await client.query<{ draft_revision_id: string | null }>(
+        "SELECT draft_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [params.id]
+      );
+      if (!featureResult.rows[0]) throw notFound("Feature not found");
+      const draftRevisionId = featureResult.rows[0]!.draft_revision_id;
+
+      // Approve the explicit in-flight revision. The fallback keeps the queue
+      // working for rows whose draft pointer has not been populated, but the
+      // pointer is what prevents approving/confusing revisions.
       const revisionResult = await client.query<{
         id: string;
         payload: { categoryKey: string; longitude: number; latitude: number; locationAccuracyM: number; mediaIds?: string[] };
@@ -66,10 +76,11 @@ export async function moderationRoutes(app: FastifyInstance) {
       }>(
         `SELECT fr.id, fr.payload, fr.author_id
          FROM feature_revisions fr
-         JOIN map_features mf ON mf.id = fr.feature_id
-         WHERE fr.feature_id = $1 AND fr.status = 'pending' AND mf.deleted_at IS NULL
+         WHERE fr.feature_id = $1
+           AND fr.status = 'pending'
+           AND ($2::uuid IS NULL OR fr.id = $2)
          ORDER BY fr.revision_no DESC LIMIT 1 FOR UPDATE`,
-        [params.id]
+        [params.id, draftRevisionId]
       );
       const revision = revisionResult.rows[0];
       if (!revision) throw notFound("Pending revision not found");
@@ -95,6 +106,7 @@ export async function moderationRoutes(app: FastifyInstance) {
       await client.query(
         `UPDATE map_features
          SET current_revision_id = $2,
+             draft_revision_id = NULL,
              status = 'published',
              category_key = $3,
              geom = ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography,
@@ -403,11 +415,19 @@ export async function moderationRoutes(app: FastifyInstance) {
 }
 
 async function activePendingRevision(client: Parameters<Parameters<typeof transaction>[0]>[0], featureId: string) {
+  const feature = await client.query<{ draft_revision_id: string | null }>(
+    "SELECT draft_revision_id FROM map_features WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+    [featureId]
+  );
+  if (!feature.rows[0]) throw notFound("Feature not found");
+  // The in-flight revision is the only one allowed to be pending; the explicit
+  // draft pointer keeps the decision attached even after rejection.
   const result = await client.query<{ id: string; author_id: string }>(
     `SELECT id, author_id FROM feature_revisions
      WHERE feature_id = $1 AND status = 'pending'
+       AND ($2::uuid IS NULL OR id = $2)
      ORDER BY revision_no DESC LIMIT 1 FOR UPDATE`,
-    [featureId]
+    [featureId, feature.rows[0]!.draft_revision_id]
   );
   const revision = result.rows[0];
   if (!revision) throw notFound("Pending revision not found");

@@ -21,6 +21,13 @@ type Feature = {
   tags: string[];
   details: Record<string, unknown>;
   media: Array<{ id: string; url: string | null; thumbnailUrl: string | null }>;
+  currentRevisionId: string | null;
+  draft: {
+    revisionId: string;
+    status: string;
+    rejectionReasonCode: string | null;
+    moderationNotes: string | null;
+  } | null;
   created_at?: string;
   updatedAt: string;
   firstPublishedAt: string | null;
@@ -149,13 +156,26 @@ onMounted(load);
           <p>{{ feature.description }}</p>
         </div>
         <div class="inline">
-          <RouterLink v-if="canEdit" class="button secondary" :to="`/submit/${feature.id}`">创建修订</RouterLink>
+          <span v-if="canEdit && feature.draft?.status === 'pending'" class="button secondary" aria-disabled="true">
+            修订审核中
+          </span>
+          <RouterLink v-else-if="canEdit" class="button secondary" :to="`/submit/${feature.id}`">
+            {{ feature.draft ? "继续编辑修订" : "创建修订" }}
+          </RouterLink>
           <button class="button ghost" type="button" @click="report">举报</button>
         </div>
       </div>
 
       <p v-if="error" class="error-box">{{ error }}</p>
       <p v-if="notice" class="success-box">{{ notice }}</p>
+
+      <p v-if="canEdit && feature.draft && ['rejected', 'changes_requested'].includes(feature.draft.status)" class="notice-box">
+        你的修订{{ feature.draft.status === "changes_requested" ? "被要求修改" : "未通过审核" }}：{{ feature.draft.rejectionReasonCode ?? "未提供原因" }}{{ feature.draft.moderationNotes ? `。${feature.draft.moderationNotes}` : "" }}
+        当前公开版本不受影响，<RouterLink :to="`/submit/${feature.id}`">点此继续修改</RouterLink>。
+      </p>
+      <p v-else-if="canEdit && feature.draft?.status === 'pending'" class="notice-box">
+        你的修订正在审核中，审核通过前此页继续显示原公开版本。
+      </p>
 
       <div class="detail-layout">
         <div class="stack">

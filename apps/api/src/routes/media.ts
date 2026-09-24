@@ -268,23 +268,36 @@ export async function mediaRoutes(app: FastifyInstance) {
     if (!media) throw notFound("Media not found");
     if (media.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
 
-    const publishedReference = await query<{ exists: boolean }>(
-      `SELECT EXISTS (
-         SELECT 1
-         FROM revision_media rm
-         JOIN map_features mf ON mf.current_revision_id = rm.revision_id
-         WHERE rm.media_id = $1
-           AND mf.status = 'published'
-           AND mf.deleted_at IS NULL
-       ) AS exists`,
+    const blockingReference = await query<{ kind: string }>(
+      `SELECT 'published' AS kind
+       FROM revision_media rm
+       JOIN map_features mf ON mf.current_revision_id = rm.revision_id
+       WHERE rm.media_id = $1
+         AND mf.status = 'published'
+         AND mf.deleted_at IS NULL
+       UNION ALL
+       SELECT 'pending' AS kind
+       FROM revision_media rm
+       JOIN feature_revisions fr ON fr.id = rm.revision_id
+       JOIN map_features mf ON mf.id = fr.feature_id
+       WHERE rm.media_id = $1
+         AND fr.status = 'pending'
+         AND mf.deleted_at IS NULL
+       LIMIT 1`,
       [params.id]
     );
-    if (publishedReference.rows[0]?.exists) {
+    if (blockingReference.rows[0]?.kind === "published") {
       throw conflict("Media attached to published content cannot be deleted separately");
+    }
+    if (blockingReference.rows[0]?.kind === "pending") {
+      throw conflict("Media attached to a revision awaiting moderation cannot be deleted until moderation finishes");
     }
 
     await transaction(async (client) => {
-      await client.query("UPDATE media_assets SET privacy_status = 'deleted', deleted_at = now(), updated_at = now() WHERE id = $1", [params.id]);
+      await client.query(
+        "UPDATE media_assets SET privacy_status = 'deleted', deleted_at = now(), detach_reason = 'owner_deleted', updated_at = now() WHERE id = $1",
+        [params.id]
+      );
       await recordAudit(client, {
         actorId: request.user!.id,
         action: "media.deleted",

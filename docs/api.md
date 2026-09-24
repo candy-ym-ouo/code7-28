@@ -41,14 +41,27 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/features` | 创建草稿 |
-| `PATCH` | `/features/:id/draft` | 更新草稿或被拒内容 |
-| `POST` | `/features/:id/submit` | 提交最新草稿 |
-| `POST` | `/features/:id/revisions` | 为已发布内容创建修订 |
+| `PATCH` | `/features/:id/draft` | 更新在途草稿/被驳回修订（不动公开版本） |
+| `POST` | `/features/:id/submit` | 提交在途草稿 |
+| `POST` | `/features/:id/revisions` | 为已发布内容创建新修订（已存在可编辑在途修订时返回 409） |
 | `POST` | `/features/:id/revisions/:revisionId/submit` | 提交修订 |
 | `GET` | `/features/:id/revisions` | 作者/审核员查看历史 |
 | `GET` | `/me/features` | 我的投稿 |
 | `DELETE` | `/features/:id` | 软删除 |
 | `POST` | `/features/:id/confirmations` | 记录时效确认 |
+
+### 草稿与修订恢复边界
+
+`map_features` 同时持有两个相互独立的指针：
+
+- `current_revision_id`：当前公开版本，批准时才切换，驳回永远不改动它。
+- `draft_revision_id`：作者的在途修订（`draft` / `pending` / `rejected` / `changes_requested`），批准后清空。
+
+因此已发布修订被驳回时，被驳回的内容仍然完整挂在 `draft_revision_id` 上。
+
+`GET /features/:id` 的顶层字段始终描述公开版本（未发布过的内容则描述唯一草稿，且仅作者/审核员可见）；在途修订通过仅作者和审核员可见的 `draft` 对象单独返回，包含独立的 `revisionId`、`status`、`rejectionReasonCode`、`moderationNotes`、正文与 `media`。编辑页必须用 `draft` 恢复表单，禁止回退到顶层公开版本。
+
+媒体绑定按修订隔离：`revision_media` 只表示“某张图属于某个修订”。从在途修订移除图片只解除该修订的绑定，不删除资产，也不影响旧公开版本；仍被已发布或审核中修订引用的媒体调用 `DELETE /media/:id` 会返回 409。
 
 ## 媒体接口
 

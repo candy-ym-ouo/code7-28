@@ -9,6 +9,34 @@ import { apiFetch } from "../lib/api";
 type Category = { key: CategoryKey; name: string };
 type MediaResult = { id: string; status: string; url: string | null; thumbnailUrl: string | null };
 type UploadItem = { file?: File; media?: MediaResult };
+type DraftResponse = {
+  revisionId: string;
+  revisionNo: number;
+  status: string;
+  submittedAt: string | null;
+  rejectionReasonCode: string | null;
+  moderationNotes: string | null;
+  categoryKey: CategoryKey;
+  title: string;
+  description: string;
+  longitude: number;
+  latitude: number;
+  locationAccuracyM: number;
+  observedAt: string;
+  condition: string;
+  stepFree: boolean | null;
+  wheelchairAccessible: boolean | null;
+  noiseLevel: number | null;
+  tags: string[];
+  details: Record<string, unknown>;
+  media: MediaResult[];
+};
+type FeatureResponse = {
+  status: string;
+  currentRevisionId: string | null;
+  draft: DraftResponse | null;
+  media: MediaResult[];
+} & Record<string, unknown>;
 type FieldDefinition = {
   key: string;
   label: string;
@@ -65,6 +93,24 @@ const error = ref("");
 const success = ref("");
 const busy = ref(false);
 const loadedFeatureStatus = ref("");
+const hasPublishedRevision = ref(false);
+const draftRevision = ref<DraftResponse | null>(null);
+
+const rejectionNotice = computed(() => {
+  const draft = draftRevision.value;
+  if (!draft || !["rejected", "changes_requested"].includes(draft.status)) return "";
+  const action = draft.status === "changes_requested" ? "审核员要求修改" : "修订未通过审核";
+  return `${action}：${draft.rejectionReasonCode ?? "未提供原因"}${draft.moderationNotes ? `。${draft.moderationNotes}` : ""}`;
+});
+
+/** Editing is blocked while the in-flight revision is being moderated. */
+const pendingRevision = computed(() => draftRevision.value?.status === "pending");
+
+const pageTitle = computed(() => {
+  if (!editId.value) return "记录一个地点细节";
+  if (!hasPublishedRevision.value) return "修改地点细节";
+  return draftRevision.value ? "继续修改修订" : "创建新修订";
+});
 
 const form = reactive({
   categoryKey: categoryKeys[0] as CategoryKey,
@@ -143,8 +189,15 @@ function onFilesSelected(event: Event) {
 }
 
 async function removeUpload(index: number) {
-  const media = uploads.value[index]?.media;
-  if (media) await apiFetch(`/media/${media.id}`, { method: "DELETE" }).catch(() => undefined);
+  const upload = uploads.value[index];
+  // Media bound to a revision (including the old public revision) must not be
+  // deleted while editing: removing it here only detaches it from the payload
+  // that will be submitted. The worker garbage-collects assets that end up
+  // unreferenced by any revision. Only media uploaded in this session is
+  // deleted immediately, since it has never been bound to a revision.
+  if (upload?.file && upload.media) {
+    await apiFetch(`/media/${upload.media.id}`, { method: "DELETE" }).catch(() => undefined);
+  }
   uploads.value.splice(index, 1);
 }
 
@@ -153,32 +206,48 @@ function recordMedia(index: number, media: MediaResult) {
   if (upload) upload.media = media;
 }
 
-async function loadExisting() {
-  if (!editId.value) return;
-  const feature = await apiFetch<Record<string, any>>(`/features/${editId.value}`);
-  loadedFeatureStatus.value = feature.status;
-  form.categoryKey = feature.categoryKey;
-  form.title = feature.title;
-  form.description = feature.description;
-  form.longitude = feature.longitude;
-  form.latitude = feature.latitude;
-  form.locationAccuracyM = feature.locationAccuracyM;
-  form.observedAt = toLocalDateTimeInput(feature.observedAt);
-  form.condition = feature.condition;
-  form.stepFree = feature.stepFree === true ? "true" : feature.stepFree === false ? "false" : "";
-  form.wheelchairAccessible = feature.wheelchairAccessible === true ? "true" : feature.wheelchairAccessible === false ? "false" : "";
-  form.noiseLevel = feature.noiseLevel ? String(feature.noiseLevel) : "";
-  form.tags = (feature.tags ?? []).join(", ");
+function applyFormValues(source: Record<string, any>) {
+  form.categoryKey = source.categoryKey;
+  form.title = source.title;
+  form.description = source.description;
+  form.longitude = source.longitude;
+  form.latitude = source.latitude;
+  form.locationAccuracyM = source.locationAccuracyM;
+  form.observedAt = toLocalDateTimeInput(source.observedAt);
+  form.condition = source.condition;
+  form.stepFree = source.stepFree === true ? "true" : source.stepFree === false ? "false" : "";
+  form.wheelchairAccessible = source.wheelchairAccessible === true ? "true" : source.wheelchairAccessible === false ? "false" : "";
+  form.noiseLevel = source.noiseLevel ? String(source.noiseLevel) : "";
+  form.tags = (source.tags ?? []).join(", ");
   resetDetails();
-  for (const [key, value] of Object.entries(feature.details ?? {})) {
+  for (const [key, value] of Object.entries(source.details ?? {})) {
     details[key] = value === null || value === undefined ? "" : String(value);
   }
-  uploads.value = (feature.media ?? []).map((item: MediaResult) => ({ media: item }));
+  uploads.value = (source.media ?? []).map((item: MediaResult) => ({ media: item }));
+}
+
+async function loadExisting() {
+  if (!editId.value) return;
+  const feature = await apiFetch<FeatureResponse>(`/features/${editId.value}`);
+  loadedFeatureStatus.value = feature.status;
+  hasPublishedRevision.value = Boolean(feature.currentRevisionId);
+  draftRevision.value = feature.draft;
+
+  // The edit form restores the in-flight draft/revision (including rejected
+  // ones), never the old public revision. Only when there is no in-flight
+  // revision at all do we seed from the published version — that is the
+  // "create a new revision" case.
+  const source = (feature.draft as Record<string, any> | null) ?? (feature as Record<string, any>);
+  applyFormValues(source);
 }
 
 async function submit() {
   error.value = "";
   success.value = "";
+  if (pendingRevision.value) {
+    error.value = "该修订正在审核中，审核结束前不能再次提交。";
+    return;
+  }
   if (!form.title.trim() || form.description.trim().length < 10) {
     error.value = "标题不能为空，说明至少 10 个字符。";
     return;
@@ -216,13 +285,39 @@ async function submit() {
     if (!featureId) {
       const created = await apiFetch<{ id: string }>("/features", { method: "POST", body: payload });
       featureId = created.id;
-      await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
-    } else if (["draft", "rejected", "changes_requested"].includes(loadedFeatureStatus.value)) {
+    } else if (draftRevision.value) {
+      // Continue editing the same in-flight revision (draft, rejected or
+      // changes-requested). This never touches the public revision.
       await apiFetch(`/features/${featureId}/draft`, { method: "PATCH", body: payload });
-      await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
     } else {
+      // No in-flight revision: start a new one from the published content.
       const revision = await apiFetch<{ id: string }>(`/features/${featureId}/revisions`, { method: "POST", body: payload });
-      await apiFetch(`/features/${featureId}/revisions/${revision.id}/submit`, { method: "POST" });
+      draftRevision.value = {
+        revisionId: revision.id,
+        revisionNo: 0,
+        status: "draft",
+        submittedAt: null,
+        rejectionReasonCode: null,
+        moderationNotes: null,
+        categoryKey: payload.categoryKey,
+        title: payload.title,
+        description: payload.description,
+        longitude: payload.longitude,
+        latitude: payload.latitude,
+        locationAccuracyM: payload.locationAccuracyM,
+        observedAt: payload.observedAt,
+        condition: payload.condition,
+        stepFree: payload.stepFree ?? null,
+        wheelchairAccessible: payload.wheelchairAccessible ?? null,
+        noiseLevel: payload.noiseLevel ?? null,
+        tags: payload.tags,
+        details: payload.details,
+        media: mediaItems
+      };
+    }
+    await apiFetch(`/features/${featureId}/submit`, { method: "POST" });
+    if (draftRevision.value) {
+      draftRevision.value = { ...draftRevision.value, status: "pending", submittedAt: new Date().toISOString(), rejectionReasonCode: null, moderationNotes: null };
     }
     success.value = "已提交审核。审核通过前不会出现在公共地图。";
     setTimeout(() => void router.push("/me/contributions"), 900);
@@ -244,15 +339,23 @@ onMounted(async () => {
   <section>
     <div class="page-heading">
       <div>
-        <h1>{{ editId ? "修改地点细节" : "记录一个地点细节" }}</h1>
+        <h1>{{ pageTitle }}</h1>
         <p>所有投稿先进入审核；照片在公开前由 Node.js 服务端完成隐私处理。</p>
       </div>
     </div>
 
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="success" class="success-box">{{ success }}</div>
+    <div v-if="rejectionNotice" class="notice-box">
+      {{ rejectionNotice }}
+      <br />公开版本未受影响；下方表单已恢复你被驳回的修订内容，修改后可重新提交。
+    </div>
+    <div v-if="pendingRevision" class="notice-box">
+      该修订正在审核中，原公开版本继续可见。审核结束前不能编辑或重复提交。
+    </div>
+    <div v-if="loadedFeatureStatus === 'hidden'" class="error-box">该内容当前已被隐藏，需管理员恢复后才能重新提交。</div>
 
-    <div class="stack">
+    <fieldset class="stack form-stack" :disabled="pendingRevision" style="border: 0; padding: 0; margin: 0">
       <section class="card"><div class="card-body">
         <h2>1. 位置</h2>
         <p class="muted">点击地图或拖动标记。不要把私人住宅内部或不可公开进入的地点作为目标。</p>
@@ -337,10 +440,10 @@ onMounted(async () => {
         <h2>5. 提交审核</h2>
         <p class="muted">提交即表示内容基于真实观察，且不包含未经处理的不当个人信息。</p>
         <div class="inline">
-          <button class="button" type="button" :disabled="busy" @click="submit">{{ busy ? "提交中…" : "提交审核" }}</button>
+          <button class="button" type="button" :disabled="busy || pendingRevision" @click="submit">{{ busy ? "提交中…" : "提交审核" }}</button>
           <RouterLink class="button ghost" to="/me/contributions">返回我的内容</RouterLink>
         </div>
       </div></section>
-    </div>
+    </fieldset>
   </section>
 </template>
